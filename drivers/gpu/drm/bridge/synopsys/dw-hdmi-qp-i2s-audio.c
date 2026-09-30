@@ -19,6 +19,25 @@
 
 #define DRIVER_NAME "dw-hdmi-qp-i2s-audio"
 
+static int force_ca = -1;
+module_param(force_ca, int, 0644);
+MODULE_PARM_DESC(force_ca, "Force HDMI test CA (-1=auto; valid: 06,07,0a,0e,12)");
+
+static bool dw_hdmi_qp_i2s_force_ca_valid(int ca, unsigned int channels)
+{
+	switch (ca) {
+	case 0x06:
+	case 0x07:
+	case 0x0e:
+	case 0x12:
+		return channels == 8;
+	case 0x0a:
+		return channels == 6;
+	default:
+		return false;
+	}
+}
+
 static inline void hdmi_write(struct dw_hdmi_qp_i2s_audio_data *audio,
 			      u32 val, int offset)
 {
@@ -48,6 +67,8 @@ static int dw_hdmi_qp_i2s_hw_params(struct device *dev, void *data,
 {
 	struct dw_hdmi_qp_i2s_audio_data *audio = data;
 	struct dw_hdmi_qp *hdmi = audio->hdmi;
+	struct hdmi_codec_params forced_hparms;
+	int ca = READ_ONCE(force_ca);
 	bool ref2stream = false;
 
 	if (fmt->bit_clk_provider | fmt->frame_clk_provider) {
@@ -57,6 +78,20 @@ static int dw_hdmi_qp_i2s_hw_params(struct device *dev, void *data,
 
 	if (fmt->bit_fmt == SNDRV_PCM_FORMAT_IEC958_SUBFRAME_LE)
 		ref2stream = true;
+
+	if (ca >= 0) {
+		if (!dw_hdmi_qp_i2s_force_ca_valid(ca, hparms->channels)) {
+			dev_err(dev, "invalid forced CA %#x for %u channels\n",
+				ca, hparms->channels);
+			return -EINVAL;
+		}
+
+		forced_hparms = *hparms;
+		forced_hparms.cea.channel_allocation = ca;
+		hparms = &forced_hparms;
+		dev_info(dev, "forcing HDMI channel allocation %#x for %u channels\n",
+			 ca, hparms->channels);
+	}
 
 	dw_hdmi_qp_set_audio_interface(hdmi, fmt, hparms);
 	dw_hdmi_qp_set_sample_rate(hdmi, hparms->sample_rate);
