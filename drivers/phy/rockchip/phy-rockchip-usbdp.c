@@ -168,6 +168,10 @@ struct rockchip_udphy {
 	bool mode_change;
 	u8 mode;
 	u8 status;
+	/* Track requests separately while DP still owns the current mapping. */
+	bool orientation_pending;
+	enum typec_orientation orientation;
+	unsigned long typec_mode;
 
 	/* utilized for USB */
 	bool hs; /* flag for high-speed */
@@ -632,17 +636,33 @@ static int udphy_dp_hpd_event_trigger(struct rockchip_udphy *udphy, bool hpd)
 	return 0;
 }
 
-static int udphy_set_typec_default_mapping(struct rockchip_udphy *udphy)
+static u8 udphy_set_typec_lane_mux(struct rockchip_udphy *udphy,
+				   unsigned long mode)
+{
+	if (mode == TYPEC_DP_STATE_C || mode == TYPEC_DP_STATE_E) {
+		udphy->lane_mux_sel[0] = PHY_LANE_MUX_DP;
+		udphy->lane_mux_sel[1] = PHY_LANE_MUX_DP;
+		udphy->lane_mux_sel[2] = PHY_LANE_MUX_DP;
+		udphy->lane_mux_sel[3] = PHY_LANE_MUX_DP;
+		udphy->dp_lanes = 4;
+		return UDPHY_MODE_DP;
+	}
+
+	udphy->lane_mux_sel[0] = udphy->flip ? PHY_LANE_MUX_DP : PHY_LANE_MUX_USB;
+	udphy->lane_mux_sel[1] = udphy->lane_mux_sel[0];
+	udphy->lane_mux_sel[2] = udphy->flip ? PHY_LANE_MUX_USB : PHY_LANE_MUX_DP;
+	udphy->lane_mux_sel[3] = udphy->lane_mux_sel[2];
+	udphy->dp_lanes = 2;
+	return UDPHY_MODE_DP_USB;
+}
+
+static int udphy_set_typec_mapping(struct rockchip_udphy *udphy)
 {
 	if (udphy->flip) {
 		udphy->dp_lane_sel[0] = 0;
 		udphy->dp_lane_sel[1] = 1;
 		udphy->dp_lane_sel[2] = 3;
 		udphy->dp_lane_sel[3] = 2;
-		udphy->lane_mux_sel[0] = PHY_LANE_MUX_DP;
-		udphy->lane_mux_sel[1] = PHY_LANE_MUX_DP;
-		udphy->lane_mux_sel[2] = PHY_LANE_MUX_USB;
-		udphy->lane_mux_sel[3] = PHY_LANE_MUX_USB;
 		udphy->dp_aux_dout_sel = udphy->no_aux_polarity_invert ? PHY_AUX_DP_DATA_POL_NORMAL : PHY_AUX_DP_DATA_POL_INVERT;
 		udphy->dp_aux_din_sel = udphy->no_aux_polarity_invert ? PHY_AUX_DP_DATA_POL_NORMAL : PHY_AUX_DP_DATA_POL_INVERT;
 		gpiod_set_value_cansleep(udphy->sbu1_dc_gpio, 1);
@@ -652,48 +672,35 @@ static int udphy_set_typec_default_mapping(struct rockchip_udphy *udphy)
 		udphy->dp_lane_sel[1] = 3;
 		udphy->dp_lane_sel[2] = 1;
 		udphy->dp_lane_sel[3] = 0;
-		udphy->lane_mux_sel[0] = PHY_LANE_MUX_USB;
-		udphy->lane_mux_sel[1] = PHY_LANE_MUX_USB;
-		udphy->lane_mux_sel[2] = PHY_LANE_MUX_DP;
-		udphy->lane_mux_sel[3] = PHY_LANE_MUX_DP;
 		udphy->dp_aux_dout_sel = PHY_AUX_DP_DATA_POL_NORMAL;
 		udphy->dp_aux_din_sel = PHY_AUX_DP_DATA_POL_NORMAL;
 		gpiod_set_value_cansleep(udphy->sbu1_dc_gpio, 0);
 		gpiod_set_value_cansleep(udphy->sbu2_dc_gpio, 1);
 	}
 
-	udphy->mode = UDPHY_MODE_DP_USB;
-	udphy->dp_lanes = 2;
+	udphy->mode = udphy_set_typec_lane_mux(udphy, udphy->typec_mode);
 
 	return 0;
 }
+
+static int udphy_apply_orientation(struct rockchip_udphy *udphy);
 
 static int udphy_orien_sw_set(struct typec_switch_dev *sw,
 			      enum typec_orientation orien)
 {
 	struct rockchip_udphy *udphy = typec_switch_get_drvdata(sw);
-	bool flipped = orien == TYPEC_ORIENTATION_REVERSE;
+	int ret;
 
 	mutex_lock(&udphy->mutex);
-
-	if (orien == TYPEC_ORIENTATION_NONE) {
-		gpiod_set_value_cansleep(udphy->sbu1_dc_gpio, 0);
-		gpiod_set_value_cansleep(udphy->sbu2_dc_gpio, 0);
-		/* unattached */
-		udphy_usb_bvalid_enable(udphy, false);
-		goto unlock_ret;
+	if (udphy->orientation != orien) {
+		udphy->typec_mode = TYPEC_STATE_USB;
+		udphy->orientation_pending = true;
 	}
-
-	if (udphy->mode != UDPHY_MODE_DP_USB || udphy->flip != flipped)
-		udphy->mode_change = true;
-
-	udphy->flip = flipped;
-	udphy_set_typec_default_mapping(udphy);
-	udphy_usb_bvalid_enable(udphy, true);
-
-unlock_ret:
+	udphy->orientation = orien;
+	ret = udphy_apply_orientation(udphy);
 	mutex_unlock(&udphy->mutex);
-	return 0;
+
+	return ret;
 }
 
 static int udphy_setup_orien_switch(struct rockchip_udphy *udphy)
@@ -866,6 +873,81 @@ assert_phy:
 assert_apb:
 	udphy_reset_assert_all(udphy);
 	return ret;
+}
+
+static int udphy_reinit(struct rockchip_udphy *udphy)
+{
+	int ret;
+
+	/* A full reset also destroys the active DP link and its configuration. */
+	if (udphy->status & UDPHY_MODE_DP)
+		return -EBUSY;
+
+	phy_notify_reset(udphy->phy_u3, PHY_NOTIFY_PRE_RESET);
+	udphy_u3_port_disable(udphy, true);
+	udelay(10);
+
+	/* Keep the existing users and their shared clock reference on failure. */
+	ret = udphy_init(udphy);
+	if (!ret) {
+		if (!udphy->hs && udphy->mode & UDPHY_MODE_USB)
+			udphy_u3_port_disable(udphy, false);
+		udphy->mode_change = false;
+	}
+
+	phy_notify_reset(udphy->phy_u3, PHY_NOTIFY_POST_RESET);
+	return ret;
+}
+
+/* Caller holds udphy->mutex; defer shared PHY changes until DP releases it. */
+static int udphy_apply_orientation(struct rockchip_udphy *udphy)
+{
+	enum typec_orientation orien = udphy->orientation;
+	bool flipped = orien == TYPEC_ORIENTATION_REVERSE;
+	int ret;
+
+	if (udphy->status & UDPHY_MODE_DP) {
+		udphy_usb_bvalid_enable(udphy, orien != TYPEC_ORIENTATION_NONE &&
+					!udphy->orientation_pending);
+		return 0;
+	}
+
+	if (orien == TYPEC_ORIENTATION_NONE) {
+		gpiod_set_value_cansleep(udphy->sbu1_dc_gpio, 0);
+		gpiod_set_value_cansleep(udphy->sbu2_dc_gpio, 0);
+		udphy->orientation_pending = false;
+		udphy_usb_bvalid_enable(udphy, false);
+		return 0;
+	}
+
+	/* Repeated PD/HPD notifications must not replace a negotiated DP map. */
+	if (udphy->orientation_pending) {
+		u8 old_mode = udphy->mode;
+		bool old_flip = udphy->flip;
+
+		udphy->flip = flipped;
+		udphy_set_typec_mapping(udphy);
+		if (old_mode != udphy->mode || old_flip != flipped)
+			udphy->mode_change = true;
+
+		udphy->orientation_pending = false;
+	}
+
+	/* DWC3 may have initialized USB before the first orientation arrived. */
+	if ((udphy->status & UDPHY_MODE_USB) &&
+	    (udphy->mode & UDPHY_MODE_USB) && udphy->mode_change) {
+		ret = udphy_reinit(udphy);
+		if (ret) {
+			udphy_usb_bvalid_enable(udphy, false);
+			dev_err(udphy->dev, "failed to apply Type-C orientation: %d\n", ret);
+			return ret;
+		}
+		dev_info(udphy->dev, "Type-C orientation %s applied to active USB PHY\n",
+			 flipped ? "reverse" : "normal");
+	}
+
+	udphy_usb_bvalid_enable(udphy, true);
+	return 0;
 }
 
 static int udphy_setup(struct rockchip_udphy *udphy)
@@ -1090,22 +1172,9 @@ static int udphy_power_on(struct rockchip_udphy *udphy, u8 mode)
 		udphy->mode_change = false;
 		phy_notify_reset(udphy->phy_u3, PHY_NOTIFY_POST_RESET);
 	} else if (udphy->mode_change) {
-		udphy->status = UDPHY_MODE_NONE;
-		phy_notify_reset(udphy->phy_u3, PHY_NOTIFY_PRE_RESET);
-
-		udphy_u3_port_disable(udphy, true);
-		udelay(10);
-
-		ret = udphy_init(udphy);
-		if (ret) {
-			phy_notify_reset(udphy->phy_u3, PHY_NOTIFY_POST_RESET);
+		ret = udphy_reinit(udphy);
+		if (ret)
 			return ret;
-		}
-
-		if (!udphy->hs && udphy->mode & UDPHY_MODE_USB)
-			udphy_u3_port_disable(udphy, false);
-		udphy->mode_change = false;
-		phy_notify_reset(udphy->phy_u3, PHY_NOTIFY_POST_RESET);
 	}
 
 	udphy->status |= mode;
@@ -1117,12 +1186,8 @@ static int udphy_power_off(struct rockchip_udphy *udphy, u8 mode)
 {
 	int ret;
 
-	if (!(udphy->mode & mode)) {
-		dev_info(udphy->dev, "mode 0x%02x is not support\n", mode);
-		return 0;
-	}
-
-	if (!udphy->status)
+	/* A mux change does not release an existing consumer's reference. */
+	if (!(udphy->status & mode))
 		return 0;
 
 	udphy->status &= ~mode;
@@ -1175,6 +1240,10 @@ static int rockchip_dp_phy_power_off(struct phy *phy)
 		goto unlock;
 
 	ret = udphy_power_off(udphy, UDPHY_MODE_DP);
+	if (!ret && udphy->orientation_pending) {
+		/* DP is off even if applying the pending USB orientation fails. */
+		udphy_apply_orientation(udphy);
+	}
 
 unlock:
 	mutex_unlock(&udphy->mutex);
@@ -1378,11 +1447,11 @@ static int rockchip_u3phy_init(struct phy *phy)
 	if (!(udphy->mode & UDPHY_MODE_USB) || udphy->hs) {
 		udphy_u3_port_disable(udphy, true);
 		goto unlock;
-	} else {
-		udphy_u3_port_disable(udphy, false);
 	}
 
 	ret = udphy_power_on(udphy, UDPHY_MODE_USB);
+	if (!ret)
+		udphy_u3_port_disable(udphy, false);
 
 unlock:
 	mutex_unlock(&udphy->mutex);
@@ -1395,13 +1464,7 @@ static int rockchip_u3phy_exit(struct phy *phy)
 	int ret = 0;
 
 	mutex_lock(&udphy->mutex);
-	/* DP only or high-speed */
-	if (!(udphy->mode & UDPHY_MODE_USB) || udphy->hs)
-		goto unlock;
-
 	ret = udphy_power_off(udphy, UDPHY_MODE_USB);
-
-unlock:
 	mutex_unlock(&udphy->mutex);
 	return ret;
 }
@@ -1416,39 +1479,18 @@ static int usbdp_typec_mux_set(struct typec_mux_dev *mux,
 			       struct typec_mux_state *state)
 {
 	struct rockchip_udphy *udphy = typec_mux_get_drvdata(mux);
+	bool orientation_pending;
 	u8 mode;
 
 	mutex_lock(&udphy->mutex);
 
-	switch (state->mode) {
-	case TYPEC_DP_STATE_C:
-		fallthrough;
-	case TYPEC_DP_STATE_E:
-		udphy->lane_mux_sel[0] = PHY_LANE_MUX_DP;
-		udphy->lane_mux_sel[1] = PHY_LANE_MUX_DP;
-		udphy->lane_mux_sel[2] = PHY_LANE_MUX_DP;
-		udphy->lane_mux_sel[3] = PHY_LANE_MUX_DP;
-		mode = UDPHY_MODE_DP;
-		udphy->dp_lanes = 4;
-		break;
-	case TYPEC_DP_STATE_D:
-		fallthrough;
-	default:
-		if (udphy->flip) {
-			udphy->lane_mux_sel[0] = PHY_LANE_MUX_DP;
-			udphy->lane_mux_sel[1] = PHY_LANE_MUX_DP;
-			udphy->lane_mux_sel[2] = PHY_LANE_MUX_USB;
-			udphy->lane_mux_sel[3] = PHY_LANE_MUX_USB;
-		} else {
-			udphy->lane_mux_sel[0] = PHY_LANE_MUX_USB;
-			udphy->lane_mux_sel[1] = PHY_LANE_MUX_USB;
-			udphy->lane_mux_sel[2] = PHY_LANE_MUX_DP;
-			udphy->lane_mux_sel[3] = PHY_LANE_MUX_DP;
-		}
-		mode = UDPHY_MODE_DP_USB;
-		udphy->dp_lanes = 2;
-		break;
-	}
+	udphy->typec_mode = state->mode;
+	orientation_pending = udphy->orientation_pending;
+	mode = (state->mode == TYPEC_DP_STATE_C || state->mode == TYPEC_DP_STATE_E) ?
+		UDPHY_MODE_DP : UDPHY_MODE_DP_USB;
+	/* Keep the active DP mapping until its pending orientation can apply. */
+	if (!orientation_pending)
+		udphy_set_typec_lane_mux(udphy, state->mode);
 
 	dev_info(udphy->dev,
 		 "Type-C mux state %lu, next mode 0x%02x, current mode 0x%02x\n",
@@ -1464,7 +1506,7 @@ static int usbdp_typec_mux_set(struct typec_mux_dev *mux,
 			usleep_range(750, 800);
 			udphy_dp_hpd_event_trigger(udphy, true);
 		} else if (data->status & DP_STATUS_HPD_STATE) {
-			if (udphy->mode != mode) {
+			if (!orientation_pending && udphy->mode != mode) {
 				udphy->mode = mode;
 				udphy->mode_change = true;
 			}
